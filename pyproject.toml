@@ -1,0 +1,34 @@
+[project]
+name = "ecommerce-after-sales-agent"
+version = "0.2.0"
+description = "面向电商场景的智能售后 Agent。"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # 工作流编排
+    "langgraph>=0.2.60",
+    "langgraph-checkpoint-sqlite>=2.0.0",
+    # 大模型：通过兼容 Chat Completions 的客户端接入 DeepSeek
+    "langchain-openai>=1.0",
+    "langchain-deepseek==1.1.1",
+    "langchain-core>=0.3.0",
+    # RAG：向量库、Embedding 与重排
+    "chromadb>=0.5.0",
+    "sentence-transformers>=3.0.0",
+    # transformers>=5 加载时可能延迟导入视觉模块，因此同时安装兼容的 torchvision。
+    "torchvision>=0.20.0",
+    # 链路追踪与评测
+    "langsmith>=0.1.140",
+    # 交互界面
+    "streamlit>=1.38.0",
+    # HTTP 接口
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    # 通用工具
+    "pydantic>=2.0",
+    "python-dotenv>=1.0.0",
+    "tabulate>=0.9.0",
+]
+
+[tool.uv]
+package = false
