@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage
+from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langgraph.checkpoint.memory import InMemorySaver
 
 import api
@@ -29,11 +30,11 @@ LEGACY_REFUNDS = """CREATE TABLE refunds (
 )"""
 
 
-class FakeSolver:
+class FakeSolver(FakeMessagesListChatModel):
     """仅模拟模型消息；工具、审批节点、状态图和数据库仍执行真实代码。"""
 
     def __init__(self, amount):
-        self.replies = iter([
+        super().__init__(responses=[
             AIMessage(content="", tool_calls=[{
                 "name": "create_refund_draft", "args": {"order_id": "ORD-5001", "amount": amount},
                 "id": "draft-call", "type": "tool_call",
@@ -41,12 +42,8 @@ class FakeSolver:
             AIMessage(content="本次退款草案等待员工审核。"),
         ])
 
-    def bind_tools(self, available):
-        self.available = {item.name for item in available}
+    def bind_tools(self, available, **kwargs):
         return self
-
-    def invoke(self, messages):
-        return next(self.replies)
 
 
 class PartialRefundTests(unittest.TestCase):

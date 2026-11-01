@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from langchain_core.messages import AIMessage
+from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.runnables import RunnableLambda
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -17,19 +18,13 @@ from ecommerce_after_sales_agent.i18n import customer_label, localize_order, mon
 from ecommerce_after_sales_agent.kb_docs import KB_ZH
 
 
-class ScriptedModel:
-    def __init__(self, replies):
-        self.replies = iter(replies)
-
-    def bind_tools(self, tools):
+class ScriptedModel(FakeMessagesListChatModel):
+    def bind_tools(self, tools, **kwargs):
         return self
 
     def with_structured_output(self, schema, *, method):
         """模拟 JSON 模式并执行真实 Pydantic 校验，不请求外部服务。"""
         return RunnableLambda(lambda messages: schema.model_validate_json(self.invoke(messages).content))
-
-    def invoke(self, messages):
-        return next(self.replies)
 
 
 class ChineseFlowTests(unittest.TestCase):
@@ -83,7 +78,7 @@ class ChineseFlowTests(unittest.TestCase):
                 self.assertTrue(database.resolve().is_relative_to(cache_root.resolve()))
                 def tool_call(name, args, call_id):
                     return {"name": name, "args": args, "id": call_id}
-                model = ScriptedModel([
+                model = ScriptedModel(responses=[
                     AIMessage(content=json.dumps({"route": "use_tools", "reason": "客户申请丢失订单退款"}, ensure_ascii=False)),
                     AIMessage(content="", tool_calls=[tool_call("get_order", {"order_id": "ORD-5001"}, "order")]),
                     AIMessage(content="", tool_calls=[tool_call("get_tracking", {"order_id": "ORD-5001"}, "tracking")]),

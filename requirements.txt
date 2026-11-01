@@ -1,4 +1,5 @@
 # --- 工作流编排 ---
+langchain==1.4.7
 langgraph>=0.2.60
 langgraph-checkpoint-sqlite>=2.0.0
 

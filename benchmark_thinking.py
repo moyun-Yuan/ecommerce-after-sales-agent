@@ -366,7 +366,7 @@ def main():
         raise SystemExit("实际模型与本次价格快照不一致，停止而不猜测费用。")
     output.parent.mkdir(exist_ok=True)
     fingerprints = {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
-                    for name in ("ecommerce_after_sales_agent/graph.py", "ecommerce_after_sales_agent/llm.py", "ecommerce_after_sales_agent/schemas.py")}
+                    for name in ("ecommerce_after_sales_agent/graph.py", "ecommerce_after_sales_agent/solver_agent.py", "ecommerce_after_sales_agent/llm.py", "ecommerce_after_sales_agent/schemas.py")}
     data = {"pricing": PRICING, "source_hashes": fingerprints, "rows": [],
             "method": "节点隔离；固定相关政策；每对交替顺序；low；4096输出上限；无额外模型裁判；临时业务库"}
     if (args.resume or args.confirm) and output.exists():

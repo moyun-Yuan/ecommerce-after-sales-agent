@@ -20,7 +20,6 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.types import Command, interrupt
-from pydantic import ValidationError
 
 from . import config, db, tools
 from .i18n import customer_label, localize_order, money, status_label
@@ -28,6 +27,7 @@ from .kb_docs import KB_ZH
 from .llm import StructuredOutputError, create_chat_model, invoke_structured
 from .schemas import ReviewDecision, TriageDecision
 from .money import from_cents, to_cents
+from .solver_agent import invoke_solver_agent
 from .usage import TokenUsageTracker
 
 config.setup_tracing()  # 在创建模型之前配置可选的 LangSmith 追踪。
@@ -167,7 +167,7 @@ SOLVER_SYSTEM = """你是电商售后智能助手，默认使用简体中文回�
 
 
 def solver_node(state: AgentState) -> dict:
-    """执行模型与工具循环，检索政策并形成答复草稿和可选操作。
+    """调用框架 Agent，整理政策依据、答复草稿和可选操作。
 
     ``answer_directly`` 路由只提供政策检索工具，从结构上限制它查询订单或创建
     退款草案；涉及具体订单的 ``use_tools`` 路由才获得完整业务工具。
@@ -182,8 +182,7 @@ def solver_node(state: AgentState) -> dict:
                       and bool(state.get("action_result")))
     if action_handled:
         active_tools = [tool for tool in active_tools if tool.name != "create_refund_draft"]
-    allowed_tools = {tool.name: tool for tool in active_tools}
-    model = _llm(config.SOLVER_MODEL, role="solver").bind_tools(active_tools)
+    model = _llm(config.SOLVER_MODEL, role="solver")
 
     context = _customer_context(state.get("customer_id"))
     messages: list[Any] = [
@@ -201,7 +200,7 @@ def solver_node(state: AgentState) -> dict:
     # 加入最近对话，使模型能理解“先申请退款、下一句再给订单号”等多轮场景。
     if config.model_options("solver")["thinking"]:
         # 跨轮保存的是最终客户答复，不是原始工具思考消息。将其作为对话材料提供，
-        # 避免伪造 reasoning_content；本轮模型原始 AIMessage 则在下方完整保留回传。
+        # 避免伪造 reasoning_content；本轮原始 AIMessage 由框架完整保留回传。
         messages.append(HumanMessage(content="请结合以下对话处理客户最后一条消息：\n"
                                      + _transcript_text(_history(state))))
     else:
@@ -209,36 +208,27 @@ def solver_node(state: AgentState) -> dict:
 
     retrieved: list[dict] = list(state.get("retrieved", []))
     tool_calls: list[dict] = []
-
-    for _ in range(MAX_SOLVER_STEPS):
-        ai: AIMessage = model.invoke(messages)
-        messages.append(ai)
-        if not ai.tool_calls:
-            break
-        for call in ai.tool_calls:
-            name, args = call["name"], call["args"]
-            if name not in allowed_tools:
-                out = json.dumps({"status": "rejected", "error": "本轮不允许调用该工具。"}, ensure_ascii=False)
-            else:
-                try:
-                    out = allowed_tools[name].invoke(args)
-                except ValidationError:
-                    out = json.dumps({"status": "rejected", "error": "工具参数格式无效，请检查参数类型。"}, ensure_ascii=False)
+    agent_messages = invoke_solver_agent(
+        model, active_tools, messages, thread_id=state.get("thread_id"),
+        customer_id=state.get("customer_id"), max_model_calls=MAX_SOLVER_STEPS,
+    )
+    calls_by_id: dict[str, dict] = {}
+    proposed = ""
+    for message in agent_messages:
+        if isinstance(message, AIMessage):
+            calls_by_id.update({call["id"]: call for call in message.tool_calls})
+            if not message.tool_calls:
+                proposed = message.content if isinstance(message.content, str) else str(message.content)
+        elif isinstance(message, ToolMessage) and message.tool_call_id in calls_by_id:
+            call = calls_by_id[message.tool_call_id]
             try:
-                tool_result = json.loads(out)
+                parsed = json.loads(message.content)
+                tool_result = parsed if isinstance(parsed, dict) else {"raw": parsed}
             except (json.JSONDecodeError, TypeError):
-                tool_result = {"raw": str(out)}
-            # 同时保存工具输入和结果，便于审计，也让后面的退款草案判断以真实结果为准。
-            tool_calls.append({"name": name, "args": args, "result": tool_result})
-            # 收集政策检索结果，供后续审查节点核对答复依据。
-            if name == "check_refund_policy":
-                try:
-                    retrieved.extend(json.loads(out).get("results", []))
-                except json.JSONDecodeError:
-                    pass
-            messages.append(ToolMessage(content=out, tool_call_id=call["id"]))
-
-    proposed = ai.content if isinstance(ai.content, str) else str(ai.content)
+                tool_result = {"raw": str(message.content)}
+            tool_calls.append({"name": call["name"], "args": call["args"], "result": tool_result})
+            if call["name"] == "check_refund_policy" and message.status != "error":
+                retrieved.extend(tool_result.get("results", []))
 
     # 只有工具确实创建出草案时才生成敏感操作，校验失败的调用不能进入审批。
     proposed_action = None

@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     # 工作流编排
+    "langchain==1.4.7",
     "langgraph>=0.2.60",
     "langgraph-checkpoint-sqlite>=2.0.0",
     # 大模型：通过兼容 Chat Completions 的客户端接入 DeepSeek
