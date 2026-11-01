@@ -38,7 +38,7 @@ class SecurityAndApiTests(unittest.TestCase):
         self.assertIn("无权", result["error"])
 
     def test_refund_draft_validates_paid_amount(self):
-        """退款草案金额必须与当前客户的订单实付金额一致。"""
+        """草案允许部分金额，但不能超过剩余可退金额。"""
         tools.set_run_context("thread-amount", "CUST-1001")
         rejected = json.loads(
             tools.create_refund_draft.invoke({"order_id": "ORD-5001", "amount": 999})
@@ -50,9 +50,9 @@ class SecurityAndApiTests(unittest.TestCase):
         self.assertEqual(accepted["status"], "drafted")
 
     def test_refund_execution_is_idempotent(self):
-        """同一订单重复执行时复用已有退款记录，不产生第二笔退款。"""
-        first = tools.issue_refund("ORD-5001", 299, "thread-first", "CUST-1001")
-        second = tools.issue_refund("ORD-5001", 299, "thread-second", "CUST-1001")
+        """同一申请重复执行时复用退款记录，不产生第二笔退款。"""
+        first = tools.issue_refund("ORD-5001", 299, "thread-first", "CUST-1001", request_id="same-request")
+        second = tools.issue_refund("ORD-5001", 299, "thread-second", "CUST-1001", request_id="same-request")
         self.assertEqual(first["status"], "refunded")
         self.assertEqual(second["status"], "already_refunded")
         with db.get_conn() as conn:

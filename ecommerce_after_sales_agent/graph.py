@@ -20,12 +20,14 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.types import Command, interrupt
+from pydantic import ValidationError
 
 from . import config, db, tools
 from .i18n import customer_label, localize_order, money, status_label
 from .kb_docs import KB_ZH
 from .llm import StructuredOutputError, create_chat_model, invoke_structured
 from .schemas import ReviewDecision, TriageDecision
+from .money import from_cents, to_cents
 from .usage import TokenUsageTracker
 
 config.setup_tracing()  # 在创建模型之前配置可选的 LangSmith 追踪。
@@ -53,7 +55,7 @@ class AgentState(TypedDict, total=False):
     proposed_action: Optional[dict]  # 等待审批的敏感操作
     citations: list[str]
     # 人工审批节点
-    approval_decision: str         # approved | rejected | none
+    approval_decision: str         # approved | rejected | failed | none
     action_result: Optional[dict]
     # 答复审查节点
     review: dict
@@ -151,6 +153,8 @@ SOLVER_SYSTEM = """你是电商售后智能助手，默认使用简体中文回�
 
 退款流程：
 - 承运商明确确认丢件后，客户申请退款时可按订单实付金额提出全额退款草案；仅物流暂未更新不能直接认定丢件。
+- 客户明确申请部分退款、退差价或协商赔付时，核对政策后按其申请金额创建草案，不自动改为全额。
+- get_order 返回 paid_amount、refunded_amount、remaining_amount；本次退款必须大于零且不超过剩余可退金额，累计不得超过实付金额。
 - 已签收商品咨询退货时，检索七日无理由退货的适用条件及例外；质量问题与无理由退货分别处理，不直接按丢件退款。
 - 仅在客户明确申请且订单、物流及政策支持时调用 create_refund_draft(order_id, amount)。
 - 草案等待员工审批，尚未执行；不得提前承诺退款已完成。
@@ -173,6 +177,12 @@ def solver_node(state: AgentState) -> dict:
         active_tools = [tools.check_refund_policy]
     else:
         active_tools = tools.SOLVER_TOOLS
+    # 审查重试只修正答复，不把同一轮已处理的申请变成第二笔退款。
+    action_handled = (state.get("approval_decision") in {"approved", "rejected", "failed"}
+                      and bool(state.get("action_result")))
+    if action_handled:
+        active_tools = [tool for tool in active_tools if tool.name != "create_refund_draft"]
+    allowed_tools = {tool.name: tool for tool in active_tools}
     model = _llm(config.SOLVER_MODEL, role="solver").bind_tools(active_tools)
 
     context = _customer_context(state.get("customer_id"))
@@ -180,6 +190,9 @@ def solver_node(state: AgentState) -> dict:
         SystemMessage(content=SOLVER_SYSTEM),
         SystemMessage(content=f"账户背景（仅供参考，除非客户提出要求，否则不要据此主动操作）：\n{context}"),
     ]
+    if action_handled:
+        messages.append(SystemMessage(content="本轮退款申请已经处理，只修正答复，不再创建草案。实际结果："
+                                     + json.dumps(state["action_result"], ensure_ascii=False)))
     if state.get("reviewer_feedback"):
         # 审查失败后，把具体原因交给处理模型修正。
         messages.append(SystemMessage(
@@ -204,7 +217,13 @@ def solver_node(state: AgentState) -> dict:
             break
         for call in ai.tool_calls:
             name, args = call["name"], call["args"]
-            out = tools.SOLVER_TOOLS_BY_NAME[name].invoke(args)
+            if name not in allowed_tools:
+                out = json.dumps({"status": "rejected", "error": "本轮不允许调用该工具。"}, ensure_ascii=False)
+            else:
+                try:
+                    out = allowed_tools[name].invoke(args)
+                except ValidationError:
+                    out = json.dumps({"status": "rejected", "error": "工具参数格式无效，请检查参数类型。"}, ensure_ascii=False)
             try:
                 tool_result = json.loads(out)
             except (json.JSONDecodeError, TypeError):
@@ -227,8 +246,9 @@ def solver_node(state: AgentState) -> dict:
         if tc["name"] == "create_refund_draft" and tc.get("result", {}).get("status") == "drafted":
             proposed_action = {
                 "action": "issue_refund",
-                "order_id": tc["args"].get("order_id"),
-                "amount": tc["args"].get("amount"),
+                "order_id": tc["result"]["order_id"],
+                "amount": tc["result"]["amount"],
+                "request_id": tc["result"]["request_id"],
                 "currency": config.CURRENCY,
             }
 
@@ -250,6 +270,8 @@ def approval_node(state: AgentState) -> dict:
     """
     action = state.get("proposed_action")
     if not action:
+        if state.get("approval_decision") in {"approved", "rejected", "failed"} and state.get("action_result"):
+            return {}
         return {"approval_decision": "none"}
 
     thread_id = state.get("thread_id", "")
@@ -262,22 +284,35 @@ def approval_node(state: AgentState) -> dict:
         "action": action["action"],
         "order_id": action.get("order_id"),
         "amount": action.get("amount"),
+        "request_id": action.get("request_id"),
         "currency": config.CURRENCY,
         "prompt": f"是否批准订单 {action.get('order_id')} 的退款方案，金额 {money(action.get('amount', 0))}？",
     })
 
-    approved = bool(decision.get("approved")) if isinstance(decision, dict) else bool(decision)
-    db.decide_approval(approval_id, approved, decided_by=(decision or {}).get("decided_by", "human")
-                       if isinstance(decision, dict) else "human")
+    approved = decision.get("approved") if isinstance(decision, dict) else decision
+    if not isinstance(approved, bool):
+        raise ValueError("审批决定必须使用布尔值。")
+    decided_by = decision.get("decided_by", "human") if isinstance(decision, dict) else "human"
 
     if approved:
-        result = tools.issue_refund(
-            action["order_id"],
-            action["amount"],
-            thread_id=thread_id,
-            customer_id=state.get("customer_id"),
-        )
+        amount = decision.get("amount") if isinstance(decision, dict) else None
+        amount = action["amount"] if amount is None else amount
+        # 兼容升级前的全额退款检查点及旧退款记录。
+        request_id = action.get("request_id") or f"legacy:RF-{action['order_id']}"
+        try:
+            amount = from_cents(to_cents(amount))
+            result = tools.issue_refund(
+                action["order_id"], amount, thread_id=thread_id,
+                customer_id=state.get("customer_id"), request_id=request_id,
+            )
+        except ValueError as exc:
+            db.decide_approval(approval_id, True, decided_by, execution_error=str(exc))
+            return {"approval_decision": "failed", "action_result": {
+                "status": "refund_failed", "order_id": action["order_id"], "error": str(exc),
+            }}
+        db.decide_approval(approval_id, True, decided_by, approved_amount=amount)
         return {"approval_decision": "approved", "action_result": result}
+    db.decide_approval(approval_id, False, decided_by)
     return {
         "approval_decision": "rejected",
         "action_result": {"status": "refund_rejected", "order_id": action.get("order_id")},
@@ -369,7 +404,11 @@ def respond_node(state: AgentState) -> dict:
 
     # 达到重试上限仍未通过审查时，使用保守策略转人工。
     review = state.get("review", {})
-    if review and not review.get("approved") and state.get("retries", 0) >= MAX_REVIEW_RETRIES:
+    review_exhausted = bool(review and not review.get("approved")
+                            and state.get("retries", 0) >= MAX_REVIEW_RETRIES)
+    action_handled = (state.get("approval_decision") in {"approved", "rejected", "failed"}
+                      and bool(state.get("action_result")))
+    if review_exhausted and not action_handled:
         reply = (
             "为确保答复准确，这个问题已转交人工专员，预计在一个工作日内跟进。"
         )
@@ -379,7 +418,7 @@ def respond_node(state: AgentState) -> dict:
 
     reply = _redact_pii(state.get("proposed_response", "").strip())
     # 保留已审查草稿中的政策来源；审批结果由代码生成，避免草稿与决定冲突。
-    cited = [c for c in state.get("citations", []) if f"[{c}]" in reply]
+    cited = [] if review_exhausted else [c for c in state.get("citations", []) if f"[{c}]" in reply]
 
     # 审批通过后明确说明模拟执行结果，不宣称发生了真实资金转移。
     if state.get("approval_decision") == "approved" and state.get("action_result"):
@@ -388,12 +427,22 @@ def respond_node(state: AgentState) -> dict:
             f"订单 {r['order_id']} 的 {money(r['amount'])} 退款方案已批准并完成模拟执行"
             f"（记录编号 {r['refund_id']}）。真实业务应原路退回，到账时间以支付渠道为准；本演示不涉及真实资金转移。"
         )
+        if "remaining_amount" in r:
+            reply += f" 本单累计已退 {money(r['refunded_amount'])}，剩余可退 {money(r['remaining_amount'])}。"
     elif state.get("approval_decision") == "rejected":
         order_id = (state.get("action_result") or {}).get("order_id", "")
         reply = (
             f"订单 {order_id} 的退款申请经人工审核未获批准，本轮未执行退款。"
             "如需补充信息或进一步核实，客服将继续跟进。"
         )
+    elif state.get("approval_decision") == "failed":
+        failed = state.get("action_result") or {}
+        reply = (f"订单 {failed.get('order_id', '')} 的退款方案未能执行："
+                 f"{failed.get('error', '请联系人工核对')} 本轮未发生退款，请重新核对可退余额。")
+
+    if review_exhausted:
+        # 答复审查失败不能抹掉已执行的业务事实，也不能触发再次退款。
+        reply += " 补充说明未通过答复审查，已标记转交人工跟进。"
 
     # 问候和澄清问题没有政策声明，因此不附加政策来源。
     if cited:
@@ -402,7 +451,7 @@ def respond_node(state: AgentState) -> dict:
     reply = _redact_pii(reply)
     db.save_response(thread_id, reply, cited, customer_id)
     tools.send_reply(reply, thread_id=thread_id, customer_id=customer_id)
-    return {"final_reply": reply, "escalated": False, "messages": [AIMessage(content=reply)]}
+    return {"final_reply": reply, "escalated": review_exhausted, "messages": [AIMessage(content=reply)]}
 
 
 # ----------------------------------------------------------------- 节点连线 --
@@ -493,12 +542,23 @@ def run_turn(query: str, customer_id: str, thread_id: str, app=None, callbacks=N
     return {**_interpret(result, app, thread_id), "usage": tracker.summary()}
 
 
-def resume_turn(thread_id: str, approved: bool, decided_by: str = "human", app=None, callbacks=None) -> dict:
+def resume_turn(thread_id: str, approved: bool, decided_by: str = "human", app=None, callbacks=None,
+                *, amount: float | None = None, approval_id: int | None = None) -> dict:
     """提交人工决定并恢复暂停的任务。"""
     app = app or get_app()
+    if amount is not None:
+        if not approved or to_cents(amount) <= 0:
+            raise ValueError("仅批准退款时可设置有效的正数金额。")
+        amount = from_cents(to_cents(amount))
+    if approval_id is not None:
+        snapshot = app.get_state(_run_config(thread_id))
+        interrupts = [item for task in snapshot.tasks for item in task.interrupts]
+        if not any(item.value.get("approval_id") == approval_id for item in interrupts
+                   if isinstance(item.value, dict)):
+            raise ValueError("此审批不属于当前暂停位置，请刷新列表。")
     tracker = TokenUsageTracker()
     result = app.invoke(
-        Command(resume={"approved": approved, "decided_by": decided_by}),
+        Command(resume={"approved": approved, "decided_by": decided_by, "amount": amount}),
         _run_config(thread_id, [tracker, *(callbacks or [])]),
     )
     return {**_interpret(result, app, thread_id), "usage": tracker.summary()}

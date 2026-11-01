@@ -13,9 +13,10 @@ from functools import lru_cache
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ecommerce_after_sales_agent import config, db, graph
+from ecommerce_after_sales_agent.money import from_cents, to_cents
 
 
 class ChatRequest(BaseModel):
@@ -31,6 +32,23 @@ class ApprovalDecision(BaseModel):
 
     approved: bool
     staff_id: str = Field(min_length=1, max_length=50)
+    amount: float | None = Field(default=None, description="可选的批准金额；不填则沿用草案金额。")
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def valid_amount(cls, value):
+        if value is None:
+            return None
+        cents = to_cents(value)
+        if cents <= 0:
+            raise ValueError("批准金额必须大于零。")
+        return from_cents(cents)
+
+    @model_validator(mode="after")
+    def amount_only_when_approved(self):
+        if not self.approved and self.amount is not None:
+            raise ValueError("拒绝申请时不能同时调整批准金额。")
+        return self
 
 
 @lru_cache(maxsize=1)
@@ -161,16 +179,22 @@ def decide(approval_id: int, decision: ApprovalDecision) -> dict[str, Any]:
     if approval["status"] != "pending":
         raise HTTPException(status_code=409, detail="该审批已经处理，不能重复提交。")
     with _workflow_lock:
-        result = graph.resume_turn(
-            approval["thread_id"],
-            approved=decision.approved,
-            decided_by=decision.staff_id,
-            app=_workflow(),
-        )
+        # 等待锁期间申请可能已被另一名员工处理，锁内再次检查。
+        approval = db.get_approval(approval_id)
+        if not approval or approval["status"] != "pending":
+            raise HTTPException(status_code=409, detail="该审批已处理，请刷新列表。")
+        try:
+            result = graph.resume_turn(
+                approval["thread_id"], approved=decision.approved,
+                decided_by=decision.staff_id, app=_workflow(),
+                amount=decision.amount, approval_id=approval_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {
         "approval_id": approval_id,
         "thread_id": approval["thread_id"],
-        "status": "approved" if decision.approved else "rejected",
+        "status": result["state"].get("approval_decision", "none"),
         "usage": result["usage"],
         **_public_state(result["state"]),
     }

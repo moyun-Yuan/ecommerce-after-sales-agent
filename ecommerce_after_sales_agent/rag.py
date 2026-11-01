@@ -183,6 +183,7 @@ def retrieve(query: str, k: int = 3, fetch_k: int = 8) -> list[dict]:
             "search_query": search_query,
             "rerank_method": config.RERANK_METHOD,
             "policy_version": POLICY_VERSION,
+            "indexed_policy_version": m.get("policy_version"),
             "currency": "CNY",
             "score": round(float(s), 4),
         }

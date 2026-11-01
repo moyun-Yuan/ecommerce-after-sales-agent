@@ -6,6 +6,8 @@ SQLite 数据仍会完成初始化，并输出跳过索引构建的提示。
 """
 from __future__ import annotations
 
+import argparse
+
 from . import config, db
 
 # --- 演示数据 ----------------------------------------------------------------
@@ -111,8 +113,12 @@ def seed_chroma() -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="初始化演示数据或单独更新政策索引。")
+    parser.add_argument("--index-only", action="store_true", help="仅重建政策索引，不重置订单与退款。")
+    args = parser.parse_args()
     print("正在初始化电商售后演示数据…")
-    seed_sqlite()
+    if not args.index_only:
+        seed_sqlite()
     seed_chroma()
     print("初始化完成。")
 

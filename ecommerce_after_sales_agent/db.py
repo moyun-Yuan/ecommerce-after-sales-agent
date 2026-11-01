@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from . import config
+from .money import from_cents, to_cents
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS customers (
@@ -66,7 +69,7 @@ CREATE TABLE IF NOT EXISTS approvals (
     thread_id   TEXT NOT NULL,
     action      TEXT NOT NULL,
     payload     TEXT,                 -- JSON 操作方案
-    status      TEXT NOT NULL,        -- 审批状态：pending | approved | rejected
+    status      TEXT NOT NULL,        -- 审批状态：pending | approved | rejected | failed
     decided_by  TEXT,
     created_at  TEXT NOT NULL,
     decided_at  TEXT
@@ -83,12 +86,14 @@ CREATE TABLE IF NOT EXISTS responses (
     created_at  TEXT NOT NULL
 );
 
--- 模拟退款结果。order_id 唯一，保证同一订单不会被重复退款。
+-- 一次退款申请只执行一次；同一订单可有多笔部分退款。
 CREATE TABLE IF NOT EXISTS refunds (
     id          TEXT PRIMARY KEY,
-    order_id    TEXT NOT NULL UNIQUE REFERENCES orders(id),
+    request_id  TEXT NOT NULL UNIQUE,
+    order_id    TEXT NOT NULL REFERENCES orders(id),
     customer_id TEXT NOT NULL REFERENCES customers(id),
     amount      REAL NOT NULL,
+    amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
     currency    TEXT NOT NULL,
     status      TEXT NOT NULL,
     thread_id   TEXT,
@@ -111,9 +116,69 @@ def get_conn() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """创建尚不存在的数据表；重复调用不会清空数据。"""
-    with get_conn() as conn:
+    """创建表并兼容迁移旧退款记录，不清空已有订单或退款。"""
+    with closing(get_conn()) as conn:
         conn.executescript(SCHEMA)
+        _migrate_refunds(conn)
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_refunds_order ON refunds(order_id)")
+        conn.commit()
+
+
+def _migrate_refunds(conn: sqlite3.Connection) -> None:
+    """旧版按订单唯一；迁移前备份，结构替换和数据复制在同一事务中完成。"""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(refunds)")}
+    if {"request_id", "amount_cents"} <= columns:
+        return
+    backup = config.DB_PATH.with_name(
+        f"{config.DB_PATH.stem}.before-partial-refunds-{uuid.uuid4().hex[:8]}.sqlite"
+    )
+    with closing(sqlite3.connect(backup)) as destination:
+        conn.backup(destination)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # 另一个进程可能已完成迁移，取得写锁后重新核对。
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(refunds)")}
+        if {"request_id", "amount_cents"} <= columns:
+            conn.commit()
+            return
+        conn.execute("""CREATE TABLE refunds_migration (
+            id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE,
+            order_id TEXT NOT NULL REFERENCES orders(id),
+            customer_id TEXT NOT NULL REFERENCES customers(id),
+            amount REAL NOT NULL, amount_cents INTEGER NOT NULL CHECK(amount_cents > 0),
+            currency TEXT NOT NULL, status TEXT NOT NULL, thread_id TEXT,
+            created_at TEXT NOT NULL
+        )""")
+        for row in conn.execute("SELECT * FROM refunds").fetchall():
+            conn.execute(
+                "INSERT INTO refunds_migration VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (row["id"], f"legacy:{row['id']}", row["order_id"], row["customer_id"],
+                 row["amount"], to_cents(row["amount"]), row["currency"], row["status"],
+                 row["thread_id"], row["created_at"]),
+            )
+        conn.execute("DROP TABLE refunds")
+        conn.execute("ALTER TABLE refunds_migration RENAME TO refunds")
+        if conn.execute("PRAGMA foreign_key_check").fetchone():
+            raise ValueError("退款表迁移外键检查失败，已保留原表与备份。")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def refund_balance(conn: sqlite3.Connection, order_id: str, paid_amount) -> dict:
+    """读取成功退款累计；调用方负责在执行退款时持有写事务。"""
+    paid = to_cents(paid_amount)
+    refunded = int(conn.execute(
+        "SELECT COALESCE(SUM(amount_cents), 0) FROM refunds "
+        "WHERE order_id = ? AND status = 'refunded'", (order_id,),
+    ).fetchone()[0])
+    if refunded > paid:
+        raise ValueError("历史累计退款超过实付金额，请人工核对。")
+    return {
+        "paid_amount": from_cents(paid), "refunded_amount": from_cents(refunded),
+        "remaining_amount": from_cents(paid - refunded), "remaining_cents": paid - refunded,
+    }
 
 
 # --- 工具和节点使用的数据写入函数 -------------------------------------------
@@ -147,14 +212,21 @@ def record_approval(thread_id: str, action: str, payload: dict[str, Any]) -> int
     LangGraph 恢复中断节点时会再次执行 interrupt() 之前的代码，因此这里必须
     复用同一会话的待审批记录，避免产生重复的“待处理”数据。
     """
-    with get_conn() as conn:
+    with closing(get_conn()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute(
-            "SELECT id FROM approvals WHERE thread_id = ? AND action = ? AND status = 'pending'"
-            " ORDER BY id DESC LIMIT 1",
+            "SELECT id, status, payload FROM approvals WHERE thread_id = ? AND action = ?"
+            " ORDER BY id DESC",
             (thread_id, action),
-        ).fetchone()
-        if existing:
-            return int(existing["id"])
+        ).fetchall()
+        for row in existing:
+            previous = json.loads(row["payload"]) if row["payload"] else {}
+            same_request = (previous.get("request_id") == payload["request_id"]
+                            if payload.get("request_id") else previous == payload)
+            if same_request:
+                return int(row["id"])
+            if row["status"] == "pending":
+                raise ValueError("当前会话已有另一笔待审批申请，请先处理。")
         cur = conn.execute(
             "INSERT INTO approvals (thread_id, action, payload, status, created_at)"
             " VALUES (?, ?, ?, 'pending', ?)",
@@ -204,14 +276,38 @@ def get_approval(approval_id: int) -> dict[str, Any] | None:
     return result
 
 
-def decide_approval(approval_id: int, approved: bool, decided_by: str = "human") -> bool:
+def decide_approval(approval_id: int, approved: bool, decided_by: str = "human", *,
+                    approved_amount: float | None = None, execution_error: str | None = None) -> bool:
     """只处理仍为 pending 的审批；返回本次是否成功更新。"""
-    with get_conn() as conn:
+    with closing(get_conn()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT payload FROM approvals WHERE id = ? AND status = 'pending'", (approval_id,),
+        ).fetchone()
+        if not row:
+            return False
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+        requested = payload.get("amount")
+        if approved_amount is not None:
+            payload.setdefault("requested_amount", requested)
+            payload["approved_amount"] = approved_amount
+            payload["amount"] = approved_amount
+        if execution_error:
+            payload["execution_error"] = execution_error
+        decision = "failed" if execution_error else ("approved" if approved else "rejected")
         cur = conn.execute(
-            "UPDATE approvals SET status = ?, decided_by = ?, decided_at = ? "
+            "UPDATE approvals SET status = ?, decided_by = ?, decided_at = ?, payload = ? "
             "WHERE id = ? AND status = 'pending'",
-            ("approved" if approved else "rejected", decided_by, now(), approval_id),
+            (decision, decided_by, now(), json.dumps(payload), approval_id),
         )
+        if approved_amount is not None and requested is not None and to_cents(requested) != to_cents(approved_amount):
+            conn.execute(
+                "INSERT INTO actions_log (thread_id, action, payload, result, created_at) "
+                "SELECT thread_id, 'approval_amount_adjusted', ?, ?, ? FROM approvals WHERE id = ?",
+                (json.dumps({"requested_amount": requested, "approved_amount": approved_amount,
+                             "decided_by": decided_by}),
+                 json.dumps({"approval_id": approval_id, "status": decision}), now(), approval_id),
+            )
         return cur.rowcount == 1
 
 

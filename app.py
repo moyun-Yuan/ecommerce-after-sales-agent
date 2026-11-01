@@ -213,17 +213,36 @@ def render_staff() -> None:
             if citations:
                 st.caption("政策依据：" + "、".join(KB_ZH.get(c, {}).get("title", c) for c in citations))
 
+            approved_amount = st.number_input(
+                "本次批准金额（元，可调整，执行时校验剩余可退余额）",
+                min_value=0.01, value=float(payload.get("amount", 0.01)), step=0.01,
+                format="%.2f", key=f"amount-{p['id']}",
+            )
+
             c1, c2, _ = st.columns([1, 1, 3])
             if c1.button("✅ 批准", key=f"ap-{p['id']}", type="primary"):
-                with st.spinner("正在模拟退款并生成最终答复…"):
-                    graph.resume_turn(thread_id, approved=True, decided_by="staff", app=app)
-                st.toast(f"申请 A-{p['id']} 已批准，模拟退款已记录。", icon="✅")
-                st.rerun()
+                try:
+                    with st.spinner("正在模拟退款并生成最终答复…"):
+                        res = graph.resume_turn(thread_id, approved=True, decided_by="staff", app=app,
+                                                amount=approved_amount, approval_id=p["id"])
+                except ValueError as exc:
+                    st.error(str(exc))
+                else:
+                    if res["state"].get("approval_decision") == "failed":
+                        st.toast("执行校验未通过，本轮未退款，请查看最终答复。", icon="⚠️")
+                    else:
+                        st.toast(f"申请 A-{p['id']} 已批准，模拟退款已记录。", icon="✅")
+                    st.rerun()
             if c2.button("❌ 拒绝", key=f"rj-{p['id']}"):
-                with st.spinner("正在记录拒绝决定并生成答复…"):
-                    graph.resume_turn(thread_id, approved=False, decided_by="staff", app=app)
-                st.toast(f"申请 A-{p['id']} 已拒绝。", icon="❌")
-                st.rerun()
+                try:
+                    with st.spinner("正在记录拒绝决定并生成答复…"):
+                        graph.resume_turn(thread_id, approved=False, decided_by="staff", app=app,
+                                          approval_id=p["id"])
+                except ValueError as exc:
+                    st.error(str(exc))
+                else:
+                    st.toast(f"申请 A-{p['id']} 已拒绝。", icon="❌")
+                    st.rerun()
 
 
 # ------------------------------------------------------------- 侧边栏 ---------

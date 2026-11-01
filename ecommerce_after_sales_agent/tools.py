@@ -7,11 +7,15 @@ from __future__ import annotations
 
 import contextvars
 import json
+import uuid
+from contextlib import closing
 
 from langchain_core.tools import tool
+from pydantic import StrictFloat
 
 from . import db, rag
 from .i18n import localize_order
+from .money import from_cents, to_cents
 
 # 当前运行上下文：让工具能够校验客户归属并关联操作日志。
 _run_ctx: contextvars.ContextVar[dict] = contextvars.ContextVar("run_ctx", default={})
@@ -43,7 +47,7 @@ def _get_owned_order(order_id: str):
     customer_id = _ctx().get("customer_id")
     if not customer_id:
         return None
-    with db.get_conn() as conn:
+    with closing(db.get_conn()) as conn:
         return conn.execute(
             "SELECT * FROM orders WHERE id = ? AND customer_id = ?",
             (order_id, customer_id),
@@ -53,7 +57,13 @@ def _get_owned_order(order_id: str):
 def get_order(order_id: str) -> str:
     """查询当前客户名下订单，返回商品、金额和状态。"""
     row = _get_owned_order(order_id)
-    result = localize_order(dict(row)) if row else {"error": "未找到该订单或当前客户无权查看。"}
+    if row:
+        result = localize_order(dict(row))
+        with closing(db.get_conn()) as conn:
+            result.update(db.refund_balance(conn, order_id, row["amount"]))
+        result.pop("remaining_cents", None)
+    else:
+        result = {"error": "未找到该订单或当前客户无权查看。"}
     _log("get_order", {"order_id": order_id}, result)
     return json.dumps(result, ensure_ascii=False)
 
@@ -86,26 +96,29 @@ def check_refund_policy(query: str) -> str:
 
 
 @tool
-def create_refund_draft(order_id: str, amount: float) -> str:
-    """校验订单与金额后创建退款草案，不执行退款。"""
+def create_refund_draft(order_id: str, amount: StrictFloat) -> str:
+    """按剩余可退金额创建全额或部分退款草案；不预占余额、不执行退款。"""
     row = _get_owned_order(order_id)
     if not row:
         result = {"status": "rejected", "error": "未找到该订单或当前客户无权操作。"}
-    elif amount <= 0 or round(float(amount), 2) != round(float(row["amount"]), 2):
-        result = {
-            "status": "rejected",
-            "error": "退款金额必须等于该订单的实付金额。",
-            "paid_amount": float(row["amount"]),
-        }
     else:
-        result = {
-        "draft_id": f"DRAFT-{order_id}",
-        "order_id": order_id,
-        "amount": round(float(amount), 2),
-        "currency": "CNY",
-        "status": "drafted",
-        "note": "退款草案已提交，等待员工审批；尚未执行退款。",
-        }
+        with closing(db.get_conn()) as conn:
+            balance = db.refund_balance(conn, order_id, row["amount"])
+        remaining = balance.pop("remaining_cents")
+        try:
+            cents = to_cents(amount)
+            if cents <= 0 or cents > remaining:
+                raise ValueError("退款金额必须大于零，且不得超过剩余可退金额。")
+        except ValueError as exc:
+            result = {"status": "rejected", "error": str(exc), **balance}
+        else:
+            request_id = f"DRAFT-{uuid.uuid4().hex}"
+            result = {
+                "draft_id": request_id, "request_id": request_id,
+                "order_id": order_id, "amount": from_cents(cents),
+                "currency": "CNY", "status": "drafted", **balance,
+                "note": "退款草案等待员工审批；尚未执行或占用可退余额，执行时再次校验。",
+            }
     _log("create_refund_draft", {"order_id": order_id, "amount": amount}, result)
     return json.dumps(result, ensure_ascii=False)
 
@@ -135,52 +148,55 @@ def issue_refund(
     amount: float,
     thread_id: str | None = None,
     customer_id: str | None = None,
+    *, request_id: str,
 ) -> dict:
-    """审批后执行模拟退款，并通过数据库唯一约束防止重复退款。"""
-    with db.get_conn() as conn:
-        # 提前取得写锁，避免界面与 API 进程同时为同一订单创建退款。
+    """按申请编号幂等执行退款，在写事务内校验累计金额，防止并发超退。"""
+    if not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 128:
+        raise ValueError("退款必须提供有效的唯一申请编号。")
+    refund_cents = to_cents(amount)
+    if refund_cents <= 0:
+        raise ValueError("退款金额必须大于零。")
+    with closing(db.get_conn()) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT customer_id, amount FROM orders WHERE id = ?",
             (order_id,),
         ).fetchone()
-        if not row or (customer_id and row["customer_id"] != customer_id):
+        if not row or not customer_id or row["customer_id"] != customer_id:
             raise ValueError("订单不存在或不属于当前客户。")
-        paid_amount = round(float(row["amount"]), 2)
-        refund_amount = round(float(amount), 2)
-        if refund_amount <= 0 or refund_amount != paid_amount:
-            raise ValueError("退款金额必须等于订单实付金额。")
-
         existing = conn.execute(
-            "SELECT id, amount, currency, status FROM refunds WHERE order_id = ?",
-            (order_id,),
+            "SELECT * FROM refunds WHERE request_id = ?", (request_id,),
         ).fetchone()
         if existing:
+            if (existing["order_id"] != order_id or existing["customer_id"] != customer_id
+                    or existing["amount_cents"] != refund_cents):
+                raise ValueError("同一退款申请编号不能用于不同订单、客户或金额。")
             result = {
-                "refund_id": existing["id"],
-                "order_id": order_id,
-                "amount": float(existing["amount"]),
-                "currency": existing["currency"],
-                "status": "already_refunded",
+                "refund_id": existing["id"], "request_id": request_id,
+                "order_id": order_id, "amount": from_cents(refund_cents),
+                "currency": existing["currency"], "status": "already_refunded",
             }
             action_name = "duplicate_refund_blocked"
         else:
+            balance = db.refund_balance(conn, order_id, row["amount"])
+            if refund_cents > balance["remaining_cents"]:
+                raise ValueError(f"退款金额超过剩余可退金额 {balance['remaining_amount']:.2f} 元。")
             result = {
-                "refund_id": f"RF-{order_id}",
-                "order_id": order_id,
-                "amount": refund_amount,
-                "currency": "CNY",
-                "status": "refunded",
+                "refund_id": f"RF-{uuid.uuid4().hex}", "request_id": request_id,
+                "order_id": order_id, "amount": from_cents(refund_cents),
+                "currency": "CNY", "status": "refunded",
             }
             conn.execute(
-                "INSERT INTO refunds (id, order_id, customer_id, amount, currency, status, thread_id, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (result["refund_id"], order_id, row["customer_id"], refund_amount,
-                 "CNY", "refunded", thread_id, db.now()),
+                "INSERT INTO refunds (id, request_id, order_id, customer_id, amount, amount_cents, "
+                "currency, status, thread_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (result["refund_id"], request_id, order_id, customer_id, result["amount"],
+                 refund_cents, "CNY", "refunded", thread_id, db.now()),
             )
             action_name = "issue_refund"
+        result.update(db.refund_balance(conn, order_id, row["amount"]))
+        result.pop("remaining_cents", None)
     db.log_action(
-        action_name, {"order_id": order_id, "amount": amount}, result,
+        action_name, {"order_id": order_id, "amount": amount, "request_id": request_id}, result,
         thread_id=thread_id, customer_id=row["customer_id"],
     )
     return result

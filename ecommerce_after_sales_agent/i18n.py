@@ -5,6 +5,7 @@ STATUS_NAMES = {
     "lost": "运输丢失", "in_transit": "运输中", "delivered": "已送达",
     "processing": "备货中", "drafted": "待审批", "refunded": "已模拟退款",
     "refund_rejected": "退款未获批准",
+    "refund_failed": "退款未能执行",
 }
 ROUTE_NAMES = {
     "answer_directly": "政策问答 / 日常咨询",
