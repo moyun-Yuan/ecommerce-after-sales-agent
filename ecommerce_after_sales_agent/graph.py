@@ -274,21 +274,22 @@ def approval_node(state: AgentState) -> dict:
         "action": action["action"],
         "order_id": action.get("order_id"),
         "amount": action.get("amount"),
-        "request_id": action.get("request_id"),
+        "request_id": action["request_id"],
         "currency": config.CURRENCY,
         "prompt": f"是否批准订单 {action.get('order_id')} 的退款方案，金额 {money(action.get('amount', 0))}？",
     })
 
-    approved = decision.get("approved") if isinstance(decision, dict) else decision
+    if not isinstance(decision, dict):
+        raise ValueError("审批决定必须使用包含 approved 字段的字典。")
+    approved = decision.get("approved")
     if not isinstance(approved, bool):
         raise ValueError("审批决定必须使用布尔值。")
-    decided_by = decision.get("decided_by", "human") if isinstance(decision, dict) else "human"
+    decided_by = decision.get("decided_by", "human")
 
     if approved:
-        amount = decision.get("amount") if isinstance(decision, dict) else None
+        amount = decision.get("amount")
         amount = action["amount"] if amount is None else amount
-        # 兼容升级前的全额退款检查点及旧退款记录。
-        request_id = action.get("request_id") or f"legacy:RF-{action['order_id']}"
+        request_id = action["request_id"]
         try:
             amount = from_cents(to_cents(amount))
             result = tools.issue_refund(

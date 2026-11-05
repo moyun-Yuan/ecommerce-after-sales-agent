@@ -214,16 +214,61 @@ class PartialRefundTests(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT amount FROM refunds").fetchone()[0], 0)
             self.assertIsNone(conn.execute("SELECT name FROM sqlite_master WHERE name='refunds_migration'").fetchone())
 
-    def test_old_pending_action_reuses_migrated_refund(self):
+    def test_old_pending_action_without_request_id_is_rejected(self):
         self.legacy_table()
         db.init_db()
         state = {"thread_id": "legacy-thread", "customer_id": "CUST-1001", "proposed_action": {
             "action": "issue_refund", "order_id": "ORD-5001", "amount": 299, "currency": "CNY",
         }}
-        with patch.object(graph, "interrupt", return_value={"approved": True}):
-            result = graph.approval_node(state)
-        self.assertEqual(result["action_result"]["status"], "already_refunded")
+        with patch.object(graph, "interrupt") as pause, patch.object(tools, "issue_refund") as execute:
+            with self.assertRaisesRegex(ValueError, "申请编号"):
+                graph.approval_node(state)
+        pause.assert_not_called()
+        execute.assert_not_called()
         self.assertEqual(self.totals(), (1, 29900))
+        with closing(db.get_conn()) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM approvals").fetchone()[0], 0)
+
+    def test_approval_requires_dictionary_decision(self):
+        state = {"thread_id": "decision-format", "customer_id": "CUST-1001", "proposed_action": {
+            "action": "issue_refund", "order_id": "ORD-5001", "amount": 50,
+            "currency": "CNY", "request_id": "current-decision",
+        }}
+        for decision in (True, False, None, "approved"):
+            with self.subTest(decision=decision):
+                with patch.object(graph, "interrupt", return_value=decision), \
+                     patch.object(tools, "issue_refund") as execute:
+                    with self.assertRaisesRegex(ValueError, "字典"):
+                        graph.approval_node(state)
+                execute.assert_not_called()
+        self.assertEqual(self.totals(), (0, 0))
+
+    def test_approval_dictionary_requires_boolean_approved(self):
+        state = {"thread_id": "decision-field", "customer_id": "CUST-1001", "proposed_action": {
+            "action": "issue_refund", "order_id": "ORD-5001", "amount": 50,
+            "currency": "CNY", "request_id": "current-field",
+        }}
+        for decision in ({}, {"approved": 1}, {"approved": "True"}, {"approved": None}):
+            with self.subTest(decision=decision):
+                with patch.object(graph, "interrupt", return_value=decision), \
+                     patch.object(tools, "issue_refund") as execute:
+                    with self.assertRaisesRegex(ValueError, "布尔"):
+                        graph.approval_node(state)
+                execute.assert_not_called()
+        self.assertEqual(self.totals(), (0, 0))
+
+    def test_record_approval_requires_request_id_and_reuses_same_request(self):
+        payload = {"action": "issue_refund", "order_id": "ORD-5001", "amount": 50}
+        for identifier in (None, "", "   ", True, "x" * 129):
+            with self.subTest(identifier=identifier), self.assertRaisesRegex(ValueError, "申请编号"):
+                db.record_approval("request-format", "issue_refund", {**payload, "request_id": identifier})
+        current = {**payload, "request_id": "current-request"}
+        first = db.record_approval("request-format", "issue_refund", current)
+        self.assertEqual(db.record_approval("request-format", "issue_refund", current), first)
+        with self.assertRaisesRegex(ValueError, "另一笔"):
+            db.record_approval("request-format", "issue_refund", {**current, "request_id": "another-request"})
+        with closing(db.get_conn()) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM approvals").fetchone()[0], 1)
 
     def test_approval_can_adjust_amount_and_preserves_audit(self):
         app = self.workflow([200])

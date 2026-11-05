@@ -199,8 +199,8 @@ def log_action(
                 thread_id,
                 customer_id,
                 action,
-                json.dumps(payload) if payload is not None else None,
-                json.dumps(result) if result is not None else None,
+                json.dumps(payload, ensure_ascii=False) if payload is not None else None,
+                json.dumps(result, ensure_ascii=False) if result is not None else None,
                 now(),
             ),
         )
@@ -210,8 +210,11 @@ def record_approval(thread_id: str, action: str, payload: dict[str, Any]) -> int
     """取得或创建待审批记录，并返回审批编号。
 
     LangGraph 恢复中断节点时会再次执行 interrupt() 之前的代码，因此这里必须
-    复用同一会话的待审批记录，避免产生重复的“待处理”数据。
+    按申请编号复用同一会话的审批记录；缺少编号的方案不进入审批。
     """
+    request_id = payload.get("request_id")
+    if not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 128:
+        raise ValueError("审批必须提供有效的申请编号，请重新创建退款草案。")
     with closing(get_conn()) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute(
@@ -221,9 +224,7 @@ def record_approval(thread_id: str, action: str, payload: dict[str, Any]) -> int
         ).fetchall()
         for row in existing:
             previous = json.loads(row["payload"]) if row["payload"] else {}
-            same_request = (previous.get("request_id") == payload["request_id"]
-                            if payload.get("request_id") else previous == payload)
-            if same_request:
+            if previous.get("request_id") == request_id:
                 return int(row["id"])
             if row["status"] == "pending":
                 raise ValueError("当前会话已有另一笔待审批申请，请先处理。")
